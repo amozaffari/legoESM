@@ -1,0 +1,19 @@
+# BSC MareNostrum 5, accelerated partition (4x H100 per node), SLURM.
+# Generate with `--machine mn5-acc` and submit the bundle's run.sh from the repo root with
+#   scripts/hpc/hpc submit <bundle>/run.sh
+# which adds the account (-A) and picks the qos (-q) from the time limit. MN5 requires
+# 20 CPU cores per requested GPU. Environment (venv, caches): scripts/cluster/mn5/.
+machine:
+  name: mn5-acc
+  hostnames: ["alogin*", "as[0-9][0-9]r*b*"]
+  scheduler: slurm
+  jax_platforms: cuda
+  precision: float32
+  venv_activate: 'source "${LEGOESM_REPO:-/gpfs/scratch/bsc32/$USER/git/legoESM}/scripts/cluster/mn5/utils.sh" && source "${LEGOESM_REPO:-/gpfs/scratch/bsc32/$USER/git/legoESM}/.venv/bin/activate"'
+  data_root: /gpfs/scratch/ehpc819/$USER/legoesm_mn5/data
+  slurm:
+    nodes: 1
+    gres: "gpu:1"
+    cpus_per_task: 20
+    time: "01:00:00"
+    output: "logs/mn5/%x_%j.out"

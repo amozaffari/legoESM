@@ -90,6 +90,32 @@ def _template_path(template: str) -> Path:
     return path
 
 
+# (machine.slurm key, sbatch flag), emitted in this order when the key is set
+_SLURM_DIRECTIVES = (
+    ("partition", "partition"),
+    ("nodes", "nodes"),
+    ("gpus", "gpus"),
+    ("gres", "gres"),
+    ("cpus_per_task", "cpus-per-task"),
+    ("time", "time"),
+    ("account", "account"),
+    ("output", "output"),
+)
+
+# SLURM executes a spooled copy of the script, so `dirname $0` is not the
+# bundle: recover the submitted path from the job record instead.
+_SLURM_CD_BUNDLE = [
+    'if [ -n "${SLURM_JOB_ID:-}" ]; then',
+    '    _script="$(scontrol show job "$SLURM_JOB_ID" | sed -n \'s/^ *Command=\\([^ ]*\\).*/\\1/p\')"',
+    '    case "$_script" in /*) ;; *) _script="${SLURM_SUBMIT_DIR}/${_script}" ;; esac',
+    '    [ -f "$_script" ] || { echo "run.sh: cannot locate the submitted script (got \'$_script\')" >&2; exit 1; }',
+    '    cd "$(dirname "$_script")"',
+    "else",
+    '    cd "$(dirname "$0")"',
+    "fi",
+]
+
+
 def render_run_sh(
     machine: dict[str, Any],
     *,
@@ -112,22 +138,22 @@ def render_run_sh(
     plat = machine.get("jax_platforms", "cpu")
     venv = machine.get("venv_activate", "") or ""
     sched = machine.get("scheduler", "none")
-    lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
+    lines = ["#!/usr/bin/env bash"]
+    # sbatch stops reading #SBATCH lines at the first command, so they must
+    # come before `set -euo pipefail`.
     if sched == "slurm":
         s = machine.get("slurm", {}) or {}
         lines.append("#SBATCH --job-name=legoesm")
-        if s.get("partition"):
-            lines.append(f"#SBATCH --partition={s['partition']}")
-        if s.get("nodes"):
-            lines.append(f"#SBATCH --nodes={s['nodes']}")
-        if s.get("gpus"):
-            lines.append(f"#SBATCH --gpus={s['gpus']}")
-        if s.get("time"):
-            lines.append(f"#SBATCH --time={s['time']}")
-        if s.get("account"):
-            lines.append(f"#SBATCH --account={s['account']}")
-        lines.append("")
-    lines.append(f"cd {shlex.quote(workdir)}" if workdir else 'cd "$(dirname "$0")"')
+        for key, flag in _SLURM_DIRECTIVES:
+            if s.get(key):
+                lines.append(f"#SBATCH --{flag}={s[key]}")
+    lines += ["", "set -euo pipefail", ""]
+    if workdir:
+        lines.append(f"cd {shlex.quote(workdir)}")
+    elif sched == "slurm":
+        lines += _SLURM_CD_BUNDLE
+    else:
+        lines.append('cd "$(dirname "$0")"')
     if venv:
         lines.append(venv)
     lines.append(f"export JAX_PLATFORMS={plat}")

@@ -18,6 +18,10 @@ export UV_PYTHON_PREFERENCE=only-managed
 # Cache and venv sit on different GPFS filesets: hardlinks are impossible
 export UV_LINK_MODE=copy
 
+# JAX persistent compile cache; the default (~/.cache) would fill the small home quota
+: "${LEGOESM_JIT_CACHE_DIR:=${LEGOESM_MN5_ROOT}/jit_cache}"
+export LEGOESM_JIT_CACHE_DIR
+
 # Compute nodes have no internet
 if [ -n "${SLURM_JOB_ID:-}" ]; then
     export UV_OFFLINE=1
