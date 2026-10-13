@@ -1,0 +1,640 @@
+#!/bin/bash
+# hpc: drive MareNostrum 5 from the local machine (sync code, submit and watch jobs, pull logs,
+# search the esarchive). Works the same for a person, a CI job or any coding agent.
+#
+#   scripts/hpc/hpc push [--dry-run] (--all | PATH...)
+#   scripts/hpc/hpc submit [-A acct] [-q queue] [-t time] [-J name] [--force] [--dry-run] [JOB | SCRIPT] [ARGS...]
+#   scripts/hpc/hpc status [JOBID | --all] [-n LINES]
+#   scripts/hpc/hpc wait JOBID [--max SECONDS]   # block until the job ends, at most SECONDS
+#   scripts/hpc/hpc cancel JOBID...
+#   scripts/hpc/hpc pull [logs | wandb | all]
+#   scripts/hpc/hpc run 'COMMAND'        # on a login node, from the remote repo root
+#   scripts/hpc/hpc transfer 'COMMAND'   # on the transfer node (esarchive is mounted only there)
+#   scripts/hpc/hpc host                 # print the login node that answers
+#   scripts/hpc/hpc config [--raw]       # check the config files and print the settings in effect
+#
+# Settings come from two files: ~/.config/skills4mn5/user.yaml (you: username, SSH, allocations,
+# storage, preferences; HPC_USER_CONFIG overrides the path) and scripts/hpc/project.yaml (this
+# project, committed; HPC_PROJECT_CONFIG). Templates: user.example.yaml, project.example.yaml.
+# Options may come before or after the positional arguments. `hpc --readonly CMD`,
+# HPC_READONLY=1 or preferences.readonly blocks push, submit, cancel and obviously writing
+# run/transfer commands. Lines of the form KEY=value on stdout (HOST=, JOBID=,
+# LOG_OUT=, ...) are meant for scripts and agents to parse; progress and warnings go to stderr.
+set -euo pipefail
+
+HPC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USER_CONFIG="${HPC_USER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/skills4mn5/user.yaml}"
+PROJECT_CONFIG="${HPC_PROJECT_CONFIG:-$HPC_DIR/project.yaml}"
+
+die() { echo "hpc: $*" >&2; exit 1; }
+note() { echo "hpc: $*" >&2; }
+
+usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# Flatten the YAML subset used by the config files (2-space maps, scalars, [a, b] and "- a"
+# lists, comments) into lines "<pre>a.b.c=value"; a list gives one line per item under one key.
+YAML_AWK='
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function unq(s) {
+    s = trim(s)
+    if (s ~ /^".*"$/ || s ~ /^\047.*\047$/) s = substr(s, 2, length(s) - 2)
+    return s
+}
+function nocomment(s,   i, c, q) {
+    q = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q != "") { if (c == q) q = "" }
+        else if (c == "\"" || c == "\047") q = c
+        else if (c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[ \t]/)) return substr(s, 1, i - 1)
+    }
+    return s
+}
+function bad(msg) { printf "hpc: %s line %d: %s\n", FILENAME, FNR, msg > "/dev/stderr"; err = 1; exit 1 }
+function path(   p, i) { p = pre key[1]; for (i = 2; i <= depth; i++) p = p "." key[i]; return p }
+{
+    if ($0 ~ /^[ ]*\t/) bad("tabs are not allowed for indentation")
+    line = nocomment($0)
+    if (line ~ /^[ \t]*$/) next
+    match(line, /^ */); ind = RLENGTH; s = trim(substr(line, ind + 1))
+    if (s == "-" || substr(s, 1, 2) == "- ") {
+        while (depth > 0 && indent[depth] > ind) depth--
+        if (depth == 0) bad("list item without a key")
+        v = unq(substr(s, 2))
+        if (v ~ /^[A-Za-z0-9_.-]+:( |$)/) bad("lists of maps are not supported")
+        if (v != "") print path() "=" v
+        next
+    }
+    while (depth > 0 && indent[depth] >= ind) depth--
+    c = index(s, ":")
+    if (c == 0 || (c < length(s) && substr(s, c + 1, 1) != " ")) bad("expected \"key: value\"")
+    depth++; key[depth] = unq(substr(s, 1, c - 1)); indent[depth] = ind
+    v = trim(substr(s, c + 1))
+    if (v == "") next
+    if (v ~ /^[|>]/) bad("block scalars (| or >) are not supported")
+    if (v ~ /^\[/) {
+        if (v !~ /\]$/) bad("unclosed [ list")
+        n = split(substr(v, 2, length(v) - 2), items, ",")
+        for (i = 1; i <= n; i++) if (unq(items[i]) != "") print path() "=" unq(items[i])
+    } else print path() "=" unq(v)
+    depth--
+}'
+# User settings first, then user.yaml's projects.<name>.* overrides as project.*, then the
+# project's own keys that were not overridden (a list is overridden as a whole)
+MERGE_AWK='
+FILENAME == ARGV[1] {
+    if (index($0, ov) == 1) { l = "project." substr($0, length(ov) + 1); k = l; sub(/=.*/, "", k); over[k] = 1; o[++n] = l }
+    else if ($0 != "" && index($0, "projects.") != 1) u[++m] = $0
+    next
+}
+{ k = $0; sub(/=.*/, "", k); if ($0 != "" && !(k in over)) p[++q] = $0 }
+END { for (i = 1; i <= m; i++) print u[i]; for (i = 1; i <= n; i++) print o[i]; for (i = 1; i <= q; i++) print p[i] }'
+UCFG=""; PCFG=""
+if [ -f "$USER_CONFIG" ]; then UCFG="$(awk -v pre= "$YAML_AWK" "$USER_CONFIG")" || exit 1; fi
+if [ -f "$PROJECT_CONFIG" ]; then PCFG="$(awk -v pre=project. "$YAML_AWK" "$PROJECT_CONFIG")" || exit 1; fi
+PNAME="$(printf '%s\n' "$PCFG" | awk '!f && index($0, "project.name=") == 1 {print substr($0, 14); f = 1}')"
+CFG="$(awk -v ov="projects.$PNAME." "$MERGE_AWK" <(printf '%s\n' "$UCFG") <(printf '%s\n' "$PCFG"))"
+
+# cfg KEY [DEFAULT]: first value of a dotted key. cfg_list KEY: all values, space separated.
+# cfg_keys PREFIX: names of the entries of a map, in file order.
+cfg() {
+    local v
+    v="$(printf '%s\n' "$CFG" | awk -v k="$1=" '!f && index($0, k) == 1 {print substr($0, length(k) + 1); f = 1}')"
+    printf '%s\n' "${v:-${2:-}}"
+}
+cfg_list() {
+    printf '%s\n' "$CFG" | awk -v k="$1=" 'index($0, k) == 1 {printf "%s%s", sep, substr($0, length(k) + 1); sep = " "} END {print ""}'
+}
+cfg_keys() {
+    printf '%s\n' "$CFG" | awk -v p="$1." 'index($0, p) == 1 {r = substr($0, length(p) + 1); sub(/[.=].*/, "", r); if (!(r in seen)) {seen[r] = 1; print r}}'
+}
+is_true() { case "$1" in true|yes|on|1) return 0 ;; *) return 1 ;; esac; }
+
+# {user} and {<storage name>} in any value: the username and storage.<name>.path from user.yaml
+expand_placeholders() {
+    local s="$CFG" n v
+    v="$(cfg user)"; [ -z "$v" ] || s="${s//\{user\}/$v}"
+    CFG="$s"
+    for n in $(cfg_keys storage); do
+        v="$(cfg "storage.$n.path")"; [ -z "$v" ] || s="${s//\{$n\}/$v}"
+    done
+    CFG="$s"
+}
+expand_placeholders
+
+HPC_HOSTS="$(cfg_list ssh.login_hosts)"
+HPC_TRANSFER_HOST="$(cfg ssh.transfer_host)"
+HPC_CONNECT_TIMEOUT="$(cfg ssh.connect_timeout 15)"
+HPC_REMOTE_REPO="$(cfg project.remote_repo)"
+REPO="$(cfg project.local_repo)"; REPO="${REPO:-$(cd "$HPC_DIR/../.." && pwd)}"
+HPC_LOGS_DIR="$(cfg project.logs_dir logs)"
+HPC_WANDB_DIR="$(cfg project.wandb_dir wandb)"
+HPC_PUSH_EXCLUDES="$(cfg_list project.push_exclude)"
+[ -n "$HPC_PUSH_EXCLUDES" ] || HPC_PUSH_EXCLUDES='__pycache__/ *.pyc .git/ .venv/ wandb/ logs/ outputs/ *.zarr *.nc *.npy *.pt *.ckpt .DS_Store'
+HPC_USER="$(cfg user)"
+HPC_PARTITION="$(cfg project.partition "$(cfg slurm.partition acc)")"
+HPC_DEBUG_MAX_MIN="$(cfg slurm.debug_max_minutes 120)"
+HPC_DEFAULT_JOB="$(cfg project.default_job)"
+# Project's usual account, else the user's default
+HPC_ACCOUNT="$(cfg project.account "$(cfg allocations.default)")"
+HPC_RECENT_HOURS="$(cfg preferences.dedupe_hours 6)"
+HPC_WAIT_MAX="$(cfg preferences.wait_max_seconds 100)"
+if is_true "$(cfg preferences.readonly false)"; then HPC_READONLY=1; fi
+for v in HPC_CONNECT_TIMEOUT HPC_DEBUG_MAX_MIN HPC_RECENT_HOURS HPC_WAIT_MAX; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || die "config: $v must be a whole number, got '${!v}'"
+done
+
+SSH_OPTS=(-o ConnectTimeout="$HPC_CONNECT_TIMEOUT" -o BatchMode=yes)
+
+# Both config files must exist; settings without a default must be set (project.* keys in
+# project.yaml, the rest in user.yaml) and project paths fully resolved
+need_files() {
+    [ -f "$USER_CONFIG" ] ||
+        die "no user settings at $USER_CONFIG: create it from $HPC_DIR/user.example.yaml (or run the hpc-setup skill)"
+    [ -f "$PROJECT_CONFIG" ] ||
+        die "no project settings at $PROJECT_CONFIG: create it from $HPC_DIR/project.example.yaml (or run the hpc-setup skill)"
+}
+need() {
+    local k v missing=()
+    need_files
+    for k in "$@"; do
+        v="$(cfg "$k")"
+        if [ -z "$v" ]; then
+            case "$k" in project.*) missing+=("${k#project.} (project.yaml)") ;; *) missing+=("$k (user.yaml)") ;; esac
+        elif [[ "$v" == *"{"*"}"* ]]; then
+            die "${k#project.}=$v: no storage area named $(echo "$v" | sed 's/.*{\([^}]*\)}.*/\1/') (or no user) in $USER_CONFIG"
+        fi
+    done
+    [ ${#missing[@]} -eq 0 ] || die "not configured: ${missing[*]} (or run the hpc-setup skill)"
+}
+
+# Job filters: the configured user, else whoever the SSH alias logs in as (sacct's own default)
+squeue_user() { if [ -n "$HPC_USER" ]; then echo "-u $HPC_USER"; else echo "--me"; fi; }
+sacct_user() { if [ -n "$HPC_USER" ]; then echo "-u $HPC_USER"; fi; }
+
+# Remote path for a repo-relative setting (absolute values are kept as they are)
+remote_path() {
+    case "$1" in /*) printf '%q' "$1" ;; *) printf '%q/%q' "$HPC_REMOTE_REPO" "${1%/}" ;; esac
+}
+
+# Queues per account: allocations.accounts.<acct>.debug_queue / long_queue, else the MN5 naming
+# <partition>_debug and <partition>_bsces (department) or <partition>_ehpc (ehpc)
+acct() { cfg "allocations.accounts.$1.$2" "${3:-}"; }
+debug_queue() {
+    local part; part="$(acct "$1" partition "$HPC_PARTITION")"
+    acct "$1" debug_queue "$(cfg slurm.debug_queue "${part}_debug")"
+}
+long_queue() {
+    local part q type
+    part="$(acct "$1" partition "$HPC_PARTITION")"; q="$(acct "$1" long_queue)"; type="$(acct "$1" type)"
+    if [ -n "$q" ]; then echo "$q"
+    elif [ "$type" = ehpc ] || { [ -z "$type" ] && [[ "$1" == ehpc* ]]; }; then echo "${part}_ehpc"
+    else echo "${part}_bsces"; fi
+}
+
+# Job entry (under `jobs`) whose script is $1, if any
+job_for_script() {
+    local j
+    for j in $(cfg_keys project.jobs); do
+        [ "$(cfg "project.jobs.$j.script")" = "$1" ] && { echo "$j"; return; }
+    done
+    return 0
+}
+
+# First login node in HPC_HOSTS that accepts a connection within the timeout
+HOST=""
+pick_host() {
+    [ -n "$HOST" ] && return
+    need ssh.login_hosts
+    local h
+    for h in $HPC_HOSTS; do
+        if ssh "${SSH_OPTS[@]}" "$h" true 2>/dev/null; then
+            HOST="$h"
+            echo "HOST=$HOST"
+            return
+        fi
+        note "$h did not answer within ${HPC_CONNECT_TIMEOUT}s, trying the next host"
+    done
+    die "no login node answered (tried: $HPC_HOSTS)"
+}
+
+# MN5 prints module-load banners on stderr at every login; drop them, keep real errors
+BANNER='^load |^Set INTEL|^CPLUS_INCLUDE_PATH|Loads storage'
+quiet() {
+    local rc
+    { "$@" 2>&1 1>&3 3>&- | { grep -v -E "$BANNER" || true; } >&2; rc=${PIPESTATUS[0]}; } 3>&1
+    return "$rc"
+}
+
+remote() { pick_host; quiet ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+
+# Remote shell snippet that sets $f to the .out log of job $1 (or the newest log without $1):
+# the job's StdOut as SLURM recorded it, else <jobid>.out or *<non-digit><jobid>.out in the logs dir
+find_log() {
+    local logs
+    logs="$(remote_path "$HPC_LOGS_DIR")"
+    if [ -n "${1:-}" ]; then
+        echo "f=\$(sacct -j $1 -X -n -P --expand-patterns -o StdOut 2>/dev/null | head -1);
+            [ -f \"\$f\" ] || f=\$(scontrol show job -o $1 2>/dev/null | sed -n 's/.* StdOut=\([^ ]*\).*/\1/p');
+            [ -f \"\$f\" ] || f=\$(ls -t $logs/$1.out $logs/*[!0-9]$1.out $logs/*/$1.out $logs/*/*[!0-9]$1.out 2>/dev/null | head -1)"
+    else
+        echo "f=\$(ls -t $logs/*.out $logs/*/*.out 2>/dev/null | head -1)"
+    fi
+}
+
+# SLURM time limit (MM, MM:SS, HH:MM:SS, D-HH, D-HH:MM, D-HH:MM:SS) -> minutes
+to_minutes() {
+    local t="$1" d=0 h=0 m=0 s=0 IFS=:
+    local -a f
+    if [[ "$t" == *-* ]]; then
+        d="${t%%-*}"; t="${t#*-}"
+        read -r -a f <<< "$t"
+        h="${f[0]:-0}"; m="${f[1]:-0}"; s="${f[2]:-0}"
+    else
+        read -r -a f <<< "$t"
+        case "${#f[@]}" in
+            1) m="${f[0]}" ;;
+            2) m="${f[0]}"; s="${f[1]}" ;;
+            *) h="${f[0]}"; m="${f[1]}"; s="${f[2]}" ;;
+        esac
+    fi
+    echo $(( 10#$d * 1440 + 10#$h * 60 + 10#$m + (10#$s > 0 ? 1 : 0) ))
+}
+
+# Value of an `#SBATCH --<key>=value` line in a local script (first match)
+sbatch_directive() {
+    sed -n "s/^#SBATCH --$2=\([^ ]*\).*/\1/p" "$1" | head -1
+}
+
+# HPC_READONLY=1 blocks everything that changes MN5: run less trusted agents with it set
+guard_write() {
+    [ "${HPC_READONLY:-0}" = 1 ] && die "$1 is blocked: read-only mode (hpc --readonly, HPC_READONLY=1 or preferences.readonly)"
+    return 0
+}
+
+# Read-only mode for run/transfer: a coarse filter on commands that obviously write or submit
+guard_command() {
+    [ "${HPC_READONLY:-0}" = 1 ] || return 0
+    if echo "$*" | grep -q -E '(^|[^a-z])(sbatch|scancel|srun|salloc|rm|mv|cp|rsync|dtcp|dtrsync|dtmv|dtrm|uv|pip|git|tee|chmod|mkdir|touch|sed -i)([^a-z]|$)|>'; then
+        die "command blocked: read-only mode allows only read-only commands"
+    fi
+}
+
+cmd_host() { pick_host; }
+
+cmd_config() {
+    if [ "${1:-}" = --raw ]; then printf '%s\n' "$CFG"; return; fi
+    [ -f "$USER_CONFIG" ] ||
+        note "missing: $USER_CONFIG (template: $HPC_DIR/user.example.yaml, or run the hpc-setup skill)"
+    [ -f "$PROJECT_CONFIG" ] ||
+        note "missing: $PROJECT_CONFIG (template: $HPC_DIR/project.example.yaml, or run the hpc-setup skill)"
+    echo "USER_CONFIG=$USER_CONFIG"
+    echo "PROJECT_CONFIG=$PROJECT_CONFIG"
+    echo "PROJECT=$PNAME"
+    echo "LOCAL_REPO=$REPO"
+    echo "REMOTE_REPO=$HPC_REMOTE_REPO"
+    echo "LOGIN_HOSTS=$HPC_HOSTS"
+    echo "TRANSFER_HOST=$HPC_TRANSFER_HOST"
+    echo "USER=${HPC_USER:-(ssh login user)}"
+    echo "LOGS_DIR=$HPC_LOGS_DIR"
+    echo "PARTITION=$HPC_PARTITION"
+    echo "READONLY=${HPC_READONLY:-0}"
+    local a j k problems=() accounts
+    accounts="$(cfg_keys allocations.accounts | tr '\n' ' ')"
+    echo "DEFAULT_ACCOUNT=$HPC_ACCOUNT"
+    for a in $accounts; do
+        echo "ACCOUNT=$a type=$(acct "$a" type '?') debug=$(debug_queue "$a") long=$(long_queue "$a")"
+    done
+    for k in $(cfg_keys storage); do echo "STORAGE=$k $(cfg "storage.$k.path")"; done
+    for j in $(cfg_keys project.jobs); do
+        local js; js="$(cfg "project.jobs.$j.script")"
+        echo "JOB=$j script=$js${HPC_DEFAULT_JOB:+$([ "$j" = "$HPC_DEFAULT_JOB" ] && echo ' (default)')}"
+        if [ -z "$js" ]; then problems+=("jobs.$j has no script (project.yaml)")
+        elif [ ! -f "$REPO/$js" ]; then problems+=("jobs.$j.script not found locally: $js"); fi
+    done
+    local missing=()
+    for k in ssh.login_hosts allocations.default project.name project.remote_repo; do
+        [ -n "$(cfg "$k")" ] || missing+=("$k")
+    done
+    echo "MISSING=${missing[*]+"${missing[*]}"}"
+    while IFS= read -r k; do
+        [ -n "$k" ] && problems+=("unresolved placeholder in ${k%%=*}: ${k#*=} (no such storage area or user in user.yaml)")
+    done < <(printf '%s\n' "$CFG" | grep -E '^(project|storage)\.[^=]*=.*\{[^}]*\}' || true)
+    while IFS= read -r k; do
+        [ -n "$k" ] && problems+=("template value left in ${k%%=*}: ${k#*=}")
+    done < <(printf '%s\n' "$CFG" | grep -E '^(user|storage\.[^=]*\.path|project\.remote_repo)=.*(<|NNN)' || true)
+    [ -z "$HPC_ACCOUNT" ] || [[ " $accounts" == *" $HPC_ACCOUNT "* ]] ||
+        problems+=("default account $HPC_ACCOUNT is not under allocations.accounts in user.yaml")
+    [ -z "$HPC_DEFAULT_JOB" ] || [ -n "$(cfg "project.jobs.$HPC_DEFAULT_JOB.script")" ] ||
+        problems+=("default_job ($HPC_DEFAULT_JOB) is not under jobs in project.yaml")
+    for k in "${problems[@]+"${problems[@]}"}"; do echo "PROBLEM=$k"; done
+    return 0
+}
+
+cmd_push() {
+    local dry="" all="" paths=() p
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run|-n) dry=1 ;;
+            --all) all=1 ;;
+            -h|--help) usage ;;
+            -*) die "unknown push option: $1" ;;
+            *) paths+=("$1") ;;
+        esac
+        shift
+    done
+    [ -n "$all" ] || [ ${#paths[@]} -gt 0 ] ||
+        die "push needs PATH... or --all (other sessions may run jobs from the remote copy, so prefer pushing only what changed)"
+    [ -n "$all" ] && [ ${#paths[@]} -gt 0 ] && die "give either --all or paths, not both"
+    [ -n "$dry" ] || guard_write push
+    need project.remote_repo
+
+    local args=(-az --itemize-changes -e "ssh ${SSH_OPTS[*]}")
+    local ex
+    set -f
+    for ex in $HPC_PUSH_EXCLUDES; do args+=(--exclude="$ex"); done
+    set +f
+    # A dry run compares contents, so it lists exactly the files that differ from the remote copy
+    [ -n "$dry" ] && args+=(--dry-run --checksum)
+
+    pick_host
+    cd "$REPO"
+    if [ -n "$all" ]; then
+        quiet rsync "${args[@]}" ./ "$HOST:$HPC_REMOTE_REPO/"
+    else
+        local rel=()
+        for p in "${paths[@]}"; do
+            p="${p#"$REPO"/}"
+            [ -e "$p" ] || die "no such path in the repo: $p"
+            rel+=("$p")
+        done
+        quiet rsync "${args[@]}" --relative "${rel[@]}" "$HOST:$HPC_REMOTE_REPO/"
+    fi
+    [ -n "$dry" ] && note "dry run: nothing was transferred" || true
+}
+
+cmd_submit() {
+    local account="" queue="" time="" name="" force="" dry="" pos=()
+    # Options are accepted anywhere (agents often put --dry-run last); after `--` everything is
+    # passed to the script. Unknown options are an error, never forwarded.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -A|--account|-q|--qos|-t|--time|-J|--job-name)
+                [ $# -ge 2 ] || die "$1 needs a value" ;;
+        esac
+        case "$1" in
+            -A|--account) account="$2"; shift ;;
+            -q|--qos) queue="$2"; shift ;;
+            -t|--time) time="$2"; shift ;;
+            -J|--job-name) name="$2"; shift ;;
+            --force) force=1 ;;
+            --dry-run|-n) dry=1 ;;
+            -h|--help) usage ;;
+            --) shift; pos+=("$@"); break ;;
+            -*) die "unknown submit option: $1 (script arguments that start with - go after --)" ;;
+            *) pos+=("$1") ;;
+        esac
+        shift
+    done
+    [ -n "$dry" ] || guard_write submit
+    # What to run: a job name from project.yaml `jobs`, a script path, or the default job
+    local job="" script="" sargs=()
+    if [ ${#pos[@]} -gt 0 ] && [ -n "$(cfg "project.jobs.${pos[0]}.script")" ]; then
+        job="${pos[0]}"; script="$(cfg "project.jobs.$job.script")"
+        [ ${#pos[@]} -gt 1 ] && sargs=("${pos[@]:1}")
+    elif [ ${#pos[@]} -gt 0 ] && [[ "${pos[0]}" == *.sh || "${pos[0]}" == *.sbatch ]]; then
+        script="${pos[0]}"; job="$(job_for_script "$script")"
+        [ ${#pos[@]} -gt 1 ] && sargs=("${pos[@]:1}")
+    else
+        [ -n "$HPC_DEFAULT_JOB" ] ||
+            die "give a job (one of: $(cfg_keys project.jobs | tr '\n' ' ')) or a script; default_job is not set in project.yaml"
+        job="$HPC_DEFAULT_JOB"; script="$(cfg "project.jobs.$job.script")"
+        [ -n "$script" ] || die "default_job ($job) has no jobs.$job.script in project.yaml"
+        [ ${#pos[@]} -gt 0 ] && sargs=("${pos[@]}")
+    fi
+    [ -f "$REPO/$script" ] || die "no such script in the local repo: $script"
+
+    # Account: -A, else the job's, else the project's, else the user's default; only accounts
+    # listed in the user's allocations
+    if [ -z "$account" ] && [ -n "$job" ]; then account="$(cfg "project.jobs.$job.account")"; fi
+    [ -n "$account" ] || account="$HPC_ACCOUNT"
+    [ -n "$account" ] || die "no account: pass -A, or set account in project.yaml or allocations.default in user.yaml"
+    local known
+    known="$(cfg_keys allocations.accounts | tr '\n' ' ')"; known="${known:-none }"
+    [[ " $known" == *" $account "* ]] ||
+        die "account $account is not under allocations.accounts in $USER_CONFIG (listed: ${known% }). Add it there first if the user has access to it."
+    if [ -z "$time" ] && [ -n "$job" ]; then time="$(cfg "project.jobs.$job.time")"; fi
+
+    # Job name: -J, else the first argument for jobs with name_from_arg (scripts whose log path
+    # uses %x per model/case), else the script's own #SBATCH -J / --job-name
+    if [ -z "$name" ] && [ -n "$job" ] && [ ${#sargs[@]} -gt 0 ] && is_true "$(cfg "project.jobs.$job.name_from_arg")"; then
+        name="${sargs[0]}"
+    fi
+    [ -n "$name" ] || name="$(sed -n 's/^#SBATCH -J \([^ ]*\).*/\1/p' "$REPO/$script" | head -1)"
+    [ -n "$name" ] || name="$(sbatch_directive "$REPO/$script" job-name)"
+
+    # Queue from the time limit: short jobs to the debug queue, everything else to the long one
+    local limit="${time:-$(sbatch_directive "$REPO/$script" time)}"
+    if [ -z "$queue" ]; then
+        [ -n "$limit" ] || die "no --time in $script; pass -t or -q"
+        if [ "$(to_minutes "$limit")" -le "$HPC_DEBUG_MAX_MIN" ]; then
+            queue="$(debug_queue "$account")"
+        else
+            queue="$(long_queue "$account")"
+        fi
+    fi
+    if [ -n "$job" ]; then echo "JOB=$job"; fi
+    echo "ACCOUNT=$account"
+
+    # Fingerprint of script + arguments, stored as the job comment, to refuse duplicate submits
+    local fp
+    fp="hpc:$(printf '%s\n' "$script" "${sargs[@]+"${sargs[@]}"}" | { md5 -q 2>/dev/null || md5sum | cut -d' ' -f1; } | cut -c1-12)"
+    local sb=(sbatch -A "$account" -q "$queue" --comment="$fp")
+    [ -n "$time" ] && sb+=(-t "$time")
+    [ -n "$name" ] && sb+=(-J "$name")
+    local sbatch_cmd
+    sbatch_cmd="$(printf '%q ' "${sb[@]}" "$script" "${sargs[@]+"${sargs[@]}"}")"
+
+    # SLURM does not create the --output/--error directories; a missing one fails the job silently
+    local logdirs="" d
+    for d in "$(sbatch_directive "$REPO/$script" output)" "$(sbatch_directive "$REPO/$script" error)"; do
+        [ -n "$d" ] && logdirs="$logdirs $(printf '%q' "$(dirname "$d")")"
+    done
+
+    echo "QUEUE=$queue"
+    echo "TIME=${limit:-default}"
+    echo "CMD=$sbatch_cmd"
+    if [ -n "$dry" ]; then note "dry run: not submitted"; return; fi
+
+    need project.remote_repo
+    pick_host  # here, not inside a $(...) below, so HOST is set once and HOST= is not captured
+    # The job runs the remote copy of the script: warn if it differs from the local one
+    local lsum rsum
+    lsum="$(md5 -q "$REPO/$script" 2>/dev/null || md5sum "$REPO/$script" | cut -d' ' -f1)"
+    rsum="$(remote "md5sum $(printf '%q' "$HPC_REMOTE_REPO/$script") 2>/dev/null | cut -d' ' -f1")" || true
+    [ "$lsum" = "$rsum" ] ||
+        note "warning: $script on $HOST differs from the local copy (push it first: hpc push $script)"
+
+    if [ -z "$force" ]; then
+        # One squeue call for both checks: lines "<jobid>|<qos>|<comment>"
+        local q same debug
+        q="$(remote "squeue -h $(squeue_user) -o '%i|%q|%k'")" || die "could not read the queue"
+        same="$(echo "$q" | awk -F'|' -v fp="$fp" '$3 == fp {printf "%s ", $1}')"
+        [ -z "$same" ] ||
+            die "an identical job (same script and arguments) is already queued or running: ${same% }. Do not resubmit; follow it with: hpc status ${same%% *}. A second identical run needs --force and the user's explicit go-ahead."
+        # An identical job that already completed recently: its results exist, do not rerun it.
+        # (Failed, timed-out or cancelled ones may be retried.)
+        local tail done_
+        tail="$(printf '%q ' "$script" "${sargs[@]+"${sargs[@]}"}")"; tail="${tail% }"
+        done_="$(remote "sacct $(sacct_user) -S now-${HPC_RECENT_HOURS}hours -X -n -P -o JobID,State,End,SubmitLine" |
+            awk -F'|' -v t="$tail" '$2 == "COMPLETED" && substr($4, length($4) - length(t) + 1) == t {print $1 " (ended " $3 ")"}' |
+            tail -1)"
+        [ -z "$done_" ] ||
+            die "an identical job already completed in the last ${HPC_RECENT_HOURS} h: $done_. Use its results (hpc status ${done_%% *}) instead of resubmitting. A rerun needs --force and the user's explicit go-ahead."
+        if [ "$queue" = "$(debug_queue "$account")" ]; then
+            debug="$(echo "$q" | awk -F'|' -v dq="$queue" '$2 == dq {printf "%s ", $1}')"
+            [ -z "$debug" ] ||
+                die "$queue allows one job per user and ${debug% } is queued or running. Wait for it (hpc status). Sending this job to another queue costs another node: only with the user's go-ahead."
+        fi
+    fi
+
+    local out jobid
+    out="$(remote "cd $(printf '%q' "$HPC_REMOTE_REPO") && mkdir -p${logdirs:- $(printf '%q' "$HPC_LOGS_DIR")} && $sbatch_cmd" 2>&1)" ||
+        die "sbatch failed: $out"
+    echo "$out" >&2
+    jobid="$(echo "$out" | sed -n 's/^Submitted batch job \([0-9]*\).*/\1/p')"
+    [ -n "$jobid" ] || die "could not read the job id from: $out"
+    echo "JOBID=$jobid"
+    local o e
+    o="$(sbatch_directive "$REPO/$script" output)"; e="$(sbatch_directive "$REPO/$script" error)"
+    [ -n "$o" ] && echo "LOG_OUT=$(echo "$o" | sed "s/%x/$name/g; s/%j/$jobid/g")"
+    [ -n "$e" ] && echo "LOG_ERR=$(echo "$e" | sed "s/%x/$name/g; s/%j/$jobid/g")"
+    return 0
+}
+
+cmd_status() {
+    local job="" all="" lines=50
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all) all=1 ;;
+            -n) lines="$2"; shift ;;
+            -h|--help) usage ;;
+            -*) die "unknown status option: $1" ;;
+            *) job="$1" ;;
+        esac
+        shift
+    done
+    need project.remote_repo
+    local repo_q
+    repo_q="$(printf '%q' "$HPC_REMOTE_REPO")"
+    local s="echo '== queue'; squeue $(squeue_user) --format='%.10i %.10P %.25j %.9T %.10M %.6D %R'"
+    if [ -n "$all" ]; then
+        s="$s; echo '== last 24 h'; sacct $(sacct_user) -S now-1days -X --format=JobID,JobName%25,QOS,State,ExitCode,Elapsed,Start,End"
+    fi
+    if [ -n "$job" ]; then
+        [[ "$job" =~ ^[0-9]+$ ]] || die "job id must be a number: $job"
+        s="$s; echo '== job $job'; sacct -j $job -X --format=JobID,JobName%25,State,ExitCode,Elapsed,Start,End"
+    fi
+    s="$s; $(find_log "$job")"
+    s="$s; if [ -n \"\$f\" ]; then echo \"== \${f#$repo_q/} (last $lines lines)\"; tail -n $lines \"\$f\";"
+    s="$s e=\${f%.out}.err; if [ -s \"\$e\" ]; then echo \"== \${e#$repo_q/} (last 20 lines)\"; tail -n 20 \"\$e\"; fi;"
+    s="$s else echo '== no log file found under $HPC_LOGS_DIR'; fi"
+    remote "$s"
+}
+
+# Wait for a job to end, polling on MN5 in one ssh session. Bounded so it fits inside an agent's
+# per-command timeout: when it returns STATE=PENDING/RUNNING, simply call it again.
+cmd_wait() {
+    local job="" max="$HPC_WAIT_MAX"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --max) max="$2"; shift ;;
+            -h|--help) usage ;;
+            -*) die "unknown wait option: $1" ;;
+            *) job="$1" ;;
+        esac
+        shift
+    done
+    [[ "$job" =~ ^[0-9]+$ ]] || die "wait needs a numeric job id"
+    [[ "$max" =~ ^[0-9]+$ ]] || die "--max must be a number of seconds"
+    need project.remote_repo
+    local repo_q
+    repo_q="$(printf '%q' "$HPC_REMOTE_REPO")"
+    remote "end=\$((SECONDS + $max))
+        while :; do
+            st=\$(sacct -j $job -X -n -P -o State | head -1 | cut -d' ' -f1)
+            case \"\$st\" in PENDING|RUNNING|REQUEUED|SUSPENDED|CONFIGURING|COMPLETING|'') ;; *) break ;; esac
+            [ \$SECONDS -ge \$end ] && break
+            sleep 15
+        done
+        echo \"STATE=\${st:-UNKNOWN}\"
+        sacct -j $job -X -n -P -o ExitCode,Elapsed,Start,End | head -1 | awk -F'|' '{print \"EXIT_CODE=\" \$1; print \"ELAPSED=\" \$2; print \"START=\" \$3; print \"END=\" \$4}'
+        case \"\$st\" in PENDING|RUNNING|REQUEUED|SUSPENDED|CONFIGURING|COMPLETING|'')
+            echo 'hpc: job not finished yet; run the same hpc wait command again' >&2 ;;
+        *)  $(find_log "$job")
+            if [ -n \"\$f\" ]; then echo \"LOG_OUT=\${f#$repo_q/}\"; echo '== last 30 lines'; tail -n 30 \"\$f\"; fi
+            e=\${f%.out}.err
+            if [ -s \"\$e\" ] && grep -q -i -E 'error|traceback|killed' \"\$e\"; then echo '== errors in .err'; grep -i -E 'error|traceback|killed' \"\$e\" | tail -n 15; fi ;;
+        esac"
+}
+
+cmd_cancel() {
+    [ $# -gt 0 ] || die "cancel needs at least one job id"
+    guard_write cancel
+    local j
+    for j in "$@"; do [[ "$j" =~ ^[0-9]+$ ]] || die "job id must be a number: $j"; done
+    remote "scancel $* && echo cancelled: $*"
+}
+
+cmd_pull() {
+    local what="${1:-logs}" dirs=()
+    case "$what" in
+        logs) dirs=("$HPC_LOGS_DIR") ;;
+        wandb) dirs=("$HPC_WANDB_DIR") ;;
+        all) dirs=("$HPC_LOGS_DIR" "$HPC_WANDB_DIR") ;;
+        -h|--help) usage ;;
+        *) die "pull takes logs, wandb or all" ;;
+    esac
+    need project.remote_repo
+    pick_host
+    local d
+    for d in "${dirs[@]}"; do
+        d="${d%/}"
+        mkdir -p "$REPO/$d"
+        quiet rsync -az --stats -e "ssh ${SSH_OPTS[*]}" "$HOST:$HPC_REMOTE_REPO/$d/" "$REPO/$d/" |
+            grep -E "Number of regular files transferred|Total transferred file size" >&2 || true
+    done
+    local latest logs="$REPO/${HPC_LOGS_DIR%/}"
+    latest="$(ls -t "$logs"/*.out "$logs"/*/*.out 2>/dev/null | head -1 || true)"
+    [ -n "$latest" ] && echo "LATEST_LOG=${latest#"$REPO"/}"
+    case "$what" in wandb|all) note "upload offline runs with: wandb sync --sync-all ./${HPC_WANDB_DIR%/}" ;; esac
+    return 0
+}
+
+cmd_run() {
+    [ $# -gt 0 ] || die "run needs a command"
+    guard_command "$*"
+    need project.remote_repo
+    remote "cd $(printf '%q' "$HPC_REMOTE_REPO") && $*"
+}
+
+cmd_transfer() {
+    [ $# -gt 0 ] || die "transfer needs a command"
+    guard_command "$*"
+    need ssh.transfer_host
+    quiet ssh "${SSH_OPTS[@]}" "$HPC_TRANSFER_HOST" "$*"
+}
+
+# --readonly before the command is the same as HPC_READONLY=1, but keeps the command line
+# starting with scripts/hpc/hpc (agent permission rules match on that prefix)
+if [ "${1:-}" = --readonly ]; then HPC_READONLY=1; shift; fi
+[ $# -gt 0 ] || usage 1
+sub="$1"; shift
+case "$sub" in
+    config) cmd_config "$@" ;;
+    push|submit|status|wait|cancel|pull|run|transfer|host)
+        need_files
+        "cmd_$sub" "$@" ;;
+    -h|--help|help) usage ;;
+    *) note "unknown command: $sub"; usage 1 ;;
+esac

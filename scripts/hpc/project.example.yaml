@@ -1,0 +1,56 @@
+# skills4mn5 project settings: what this project is on MareNostrum 5. Committed with the repo
+# and shared by everyone who works on it, so nothing personal here: paths use {user} and the
+# storage names from each person's ~/.config/skills4mn5/user.yaml ({scratch}, {projects}, ...).
+# Copy to scripts/hpc/project.yaml, or run the hpc-setup skill.
+#
+# Format: plain YAML with 2-space indentation, maps, scalars and lists ([a, b] or "- a").
+# Quote values that start with * & ! { or contain " #".
+
+# Short project name; user.yaml can override keys under projects.<name>
+name: myrepo
+
+# This project's copy on MN5
+remote_repo: "{scratch}/git/myrepo"
+# Local repo root; empty = the repo containing scripts/hpc
+local_repo:
+
+# Where sbatch writes .out/.err (relative to the repo root; searched one level deep too)
+logs_dir: logs
+wandb_dir: wandb
+
+# Never pushed to MN5
+push_exclude:
+  - "__pycache__/"
+  - "*.pyc"
+  - ".git/"
+  - ".venv/"
+  - "wandb/"
+  - "logs/"
+  - "outputs/"
+  - "*.zarr"
+  - "*.nc"
+  - "*.grib"
+  - "*.npy"
+  - "*.pt"
+  - "*.ckpt"
+  - ".DS_Store"
+
+# Optional: the allocation this project normally charges (must be in the user's allocations;
+# empty = the user's allocations.default), and the partition if not the user's
+account:
+partition:
+
+# This project's launch scripts. `hpc submit NAME ARGS...` runs jobs.NAME.script; the agent reads
+# usage/needs before submitting. Optional per job: account, time (overrides #SBATCH --time),
+# name_from_arg (true = the first argument names the job, e.g. one log per model via %x).
+# Quote times: time: "04:00:00" (unquoted, YAML tools read it as a number).
+default_job: train
+jobs:
+  train:
+    script: scripts/train.sh
+    usage: "scripts/train.sh -- --config CONFIG.yaml"
+    needs: training data staged on MN5 scratch; code pushed
+  # forecast:
+  #   script: scripts/acc_forecast.sh
+  #   name_from_arg: true
+  #   usage: "<model> <init time> <nsteps>, e.g. pangu 2022-01-01T06:00 4"

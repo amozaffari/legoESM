@@ -1,0 +1,78 @@
+# skills4mn5 user settings: who you are on MareNostrum 5. One file per person and machine,
+# shared by every project: ~/.config/skills4mn5/user.yaml (or the file named by HPC_USER_CONFIG).
+# Never commit it. Fill it in from this template, or run the hpc-setup skill.
+# `scripts/hpc/hpc config` (from any project) checks it.
+#
+# Format: plain YAML with 2-space indentation, maps, scalars and lists ([a, b] or "- a").
+# Quote values that start with * & ! { or contain " #".
+
+# Your MN5 username; also {user} in project paths
+user: bscNNNNNN
+
+ssh:
+  # Aliases from ~/.ssh/config, tried in order; the first that answers wins
+  login_hosts: [mn5-alogin1, mn5-glogin1]
+  # Transfer node (the only place /gpfs/archive, i.e. the esarchive, is mounted)
+  transfer_host: mn5-transfer1
+  connect_timeout: 15
+
+# Your areas on MN5. A project's remote_repo can use them by name: "{scratch}/git/myrepo".
+# The agent proposes them as destinations for data and respects the notes.
+storage:
+  scratch:
+    path: /gpfs/scratch/<group>/bscNNNNNN
+    note: personal work area in the group scratch
+  # projects:
+  #   path: /gpfs/projects/<group>/bscNNNNNN
+  #   note: backed up, small quota
+  # ehpc_scratch:
+  #   path: /gpfs/scratch/ehpcNNN/bscNNNNNN
+  #   note: EuroHPC project scratch, most free space
+
+# Every account you may charge. `hpc submit` refuses accounts that are not listed here.
+# type: department (BSC allocation) or ehpc (EuroHPC). long_queue defaults to
+# <partition>_bsces for department and <partition>_ehpc for ehpc accounts.
+allocations:
+  default: bsc32
+  accounts:
+    bsc32:
+      type: department
+      long_queue: acc_bsces
+      note: BSC-ES department allocation, shared with the whole group
+    # ehpcNNN:
+    #   type: ehpc
+    #   long_queue: acc_ehpc
+    #   note: EuroHPC project <name>; hours are limited, until <YYYY-MM>
+
+slurm:
+  # acc = GPU nodes, gp = general purpose (a project can override it)
+  partition: acc
+  # Jobs up to debug_max_minutes go to the debug queue (one job per user at a time)
+  debug_queue: acc_debug
+  debug_max_minutes: 120
+
+preferences:
+  # Ask before a job longer than this, with more nodes, or more jobs at once,
+  # and before copying or pulling more data than copy_gb
+  ask_before:
+    hours: 2
+    nodes: 1
+    jobs: 1
+    copy_gb: 50
+  # submit refuses an identical job (same script + arguments) completed this recently
+  dedupe_hours: 6
+  # longest single `hpc wait` call
+  wait_max_seconds: 100
+  # true = block push, submit, cancel and writing commands (same as hpc --readonly)
+  readonly: false
+  # Your own standing rules for the agent; they apply like scripts/hpc/RULES.md and win over it
+  notes:
+    # - Use the EuroHPC allocation for anything longer than the debug queue.
+    # - Never pull checkpoints; I only need logs locally.
+
+# Per-project overrides, by the project's `name`: any key of its project.yaml, e.g. when your
+# copy lives somewhere else than the committed path says.
+# projects:
+#   myrepo:
+#     remote_repo: /gpfs/projects/<group>/bscNNNNNN/myrepo
+#     account: ehpcNNN
